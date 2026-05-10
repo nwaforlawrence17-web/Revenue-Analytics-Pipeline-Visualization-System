@@ -1,0 +1,46 @@
+{
+  "report_metadata": {
+    "audit_timestamp": "2026-05-07T20:33:14.325770",
+    "checksum_status": "VERIFIED",
+    "pipeline_status": "PASS_WITH_WARNINGS"
+  },
+  "summary_counts": {
+    "raw_total_rows": 5101,
+    "valid_rows_gold": 3342,
+    "rejected_rows_total": 1759,
+    "mismatch_delta": 0
+  },
+  "data_quality_dimensions": {
+    "completeness_score": "80.36%",
+    "validity_score": "94.08%",
+    "uniqueness_score": "98.39%",
+    "accuracy_score": "86.77%",
+    "consistency_score": "100.0%",
+    "overall_quality_score": "65.52%"
+  },
+  "severity_breakdown": {
+    "CRITICAL": 1304,
+    "SUSPICIOUS": 373,
+    "WARNING": 82,
+    "HIGH": 0,
+    "MEDIUM": 0,
+    "LOW": 0
+  },
+  "rejection_reason_breakdown": {
+    "UNPARSEABLE_OR_MISSING_ORDER_DATE": 735,
+    "SUSPICIOUS_LOSS_MARGIN": 302,
+    "MARGIN_OUT_OF_RANGE": 302,
+    "UNPARSEABLE_OR_MISSING_AMOUNT": 226,
+    "REDUNDANT_DUPLICATE_ORDER_ID": 82,
+    "UNIT_PRICE_LOW_HERMAN_MILLER_CHAIR": 81,
+    "UNIT_PRICE_LOW_MACBOOK_PRO_M3": 74,
+    "UNIT_PRICE_LOW_CONFERENCE_TABLE": 70,
+    "UNIT_PRICE_LOW_IPHONE_15_PRO": 68,
+    "UNIT_PRICE_LOW_SAMSUNG_S23_ULTRA": 65,
+    "UNIT_PRICE_LOW_ENTERPRISE_SERVER": 65,
+    "UNIT_PRICE_LOW_RACK_CABINET": 62,
+    "UNIT_PRICE_LOW_NETWORK_SWITCH": 60,
+    "UNIT_PRICE_LOW_ELECTRIC_STANDING_DESK": 56,
+    "UNPARSEABLE_OR_MISSING_AMOUNT_ORDER_DATE": 41
+  }
+}
