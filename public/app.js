@@ -532,7 +532,7 @@ function renderTablePage() {
   tbody.innerHTML = rows.map(r => {
     const statusCls = r.order_status === 'COMPLETED' ? 'badge-completed'
                     : r.order_status === 'PENDING'   ? 'badge-pending'
-                    : r.order_status === 'CANCELLED' ? 'badge-cancelled' : 'badge-other';
+                    : r.order_status === 'CANCELED'  ? 'badge-cancelled' : 'badge-other';
     const profitCls = (r.profit_usd !== null && r.profit_usd < 0) ? ' cell-negative' : '';
     return `<tr>
       <td><code style="font-size:11px;color:#94a3b8">${nullSafe(r.order_id)}</code></td>
@@ -589,7 +589,10 @@ async function initMeta() {
 
     console.log("Meta initialized. State:", state.dateStart, "to", state.dateEnd);
     // Header row count and freshness
-    document.getElementById('header-source').textContent = `🗄️ Source: ${meta.dataset?.path || 'warehouse.db'}`;
+    const sqlName = meta.dataset?.path || 'warehouse.db';
+    const csvName = 'validated_data.csv';
+    const modeLabel = state.sourceMode === 'sql' ? `SQL (${sqlName})` : `CSV (${csvName})`;
+    document.getElementById('header-source').textContent = `🗄️ Source: ${modeLabel}`;
     document.getElementById('header-rows').textContent = `${meta.dataset?.rows?.toLocaleString() || '?'} records`;
     if (meta.dataset?.last_modified) {
       const dateObj = new Date(meta.dataset.last_modified);
@@ -908,6 +911,10 @@ function initSourceToggle() {
     
     // Update UI labels immediately
     const sourceLabel = document.getElementById('header-source');
+    const sqlName = 'warehouse.db';
+    const csvName = 'validated_data.csv';
+    const modeLabel = state.sourceMode === 'sql' ? `SQL (${sqlName})` : `CSV (${csvName})`;
+    sourceLabel.textContent = `🗄️ Source: ${modeLabel}`;
     if (state.sourceMode === 'sql') {
         sourceLabel.style.color = 'var(--accent-teal)';
     } else {

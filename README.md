@@ -24,7 +24,7 @@ This isn't just a dashboard; it's a **modernized data pipeline** designed for sp
 I intentionally built this project to showcase a **migration from Legacy to Modern architecture**:
 
 *   **Legacy (CSV-Based):** Originally, the system read directly from a flat CSV file. It was slow, lacked data types, and couldn't scale.
-*   **Modern (SQL-Warehouse):** I engineered a custom ETL pipeline (`pipeline/to_sqlite.py`) that cleans the data and migrates it into a structured **SQLite Warehouse**.
+*   **Modern (SQL-Warehouse):** I engineered a custom ETL pipeline (`public/pipeline/to_sqlite.py`) that cleans the data and migrates it into a structured **SQLite Warehouse**.
 
 > [!TIP]
 > **Check the "Source Toggle" in the dashboard!** You can literally flip a switch to see the difference between the legacy CSV engine and the new SQL-powered brain.
@@ -57,11 +57,22 @@ I intentionally built this project to showcase a **migration from Legacy to Mode
     ```bash
     pip install -r requirements.txt
     ```
-3.  **Launch the Dashboard:**
+3.  **Run the ETL + data audit (writes to `data/`):**
+    ```bash
+    python public/pipeline/run_pipeline.py
+    ```
+4.  **Migrate to the SQLite warehouse (rebuilds `data/warehouse.db`):**
+    ```bash
+    python public/pipeline/to_sqlite.py
+    ```
+
+    > The warehouse stores `order_date` as `YYYY-MM-DD` for correct SQL filtering and fast indexing.
+
+5.  **Launch the Dashboard:**
     ```bash
     python server/server.py
     ```
-4.  **Visit:** `http://localhost:8787`
+6.  **Visit:** `http://localhost:8787`
 
 ---
 

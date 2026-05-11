@@ -3,7 +3,9 @@ import sqlite3
 from pathlib import Path
 
 def migrate_to_sqlite():
-    root = Path(__file__).resolve().parents[1]
+    # Revenue Analytics Pipeline & Visualization System/public/pipeline/to_sqlite.py
+    # Repo root is two levels up from this file.
+    root = Path(__file__).resolve().parents[2]
     csv_path = root / "data" / "validated_data.csv"
     db_path = root / "data" / "warehouse.db"
 
@@ -27,7 +29,9 @@ def migrate_to_sqlite():
 
     df['region'] = df['region'].apply(get_canonical_region)
     df['region_group'] = df['region'].apply(get_region_group)
-    df['order_date'] = pd.to_datetime(df['order_date'])
+
+    # Store date-only values to guarantee correct SQL filtering and meta dates.
+    df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce', format='mixed').dt.strftime('%Y-%m-%d')
 
     # Rename columns to match the Semantic Layer's expected schema
     df = df.rename(columns={
@@ -44,6 +48,7 @@ def migrate_to_sqlite():
     df.to_sql('orders', conn, if_exists='replace', index=False)
 
     # Add an index on order_date for performance (Senior move!)
+    conn.execute("DROP INDEX IF EXISTS idx_order_date")
     conn.execute("CREATE INDEX idx_order_date ON orders(order_date)")
     conn.commit()
     conn.close()

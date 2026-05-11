@@ -12,13 +12,26 @@ from validate import validate_data
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    # Revenue Analytics Pipeline & Visualization System/public/pipeline/run_pipeline.py
+    # Repo root is two levels up from this file.
+    return Path(__file__).resolve().parents[2]
+
+
+def _select_raw_source(root: Path) -> Path | None:
+    candidates = [
+        root / "data" / "raw_sales_master.csv",
+        root / "data" / "raw_sales.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
 
 
 def run() -> int:
     root = _project_root()
     # Updated paths per portfolio optimization
-    raw_path = root / "data" / "raw_sales_master.csv"
+    raw_path = _select_raw_source(root)
     outputs_dir = root / "data"
     error_log_path = outputs_dir / "error_log.csv"
     report_path = outputs_dir / "validation_report.json"
@@ -26,8 +39,11 @@ def run() -> int:
 
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    if not raw_path.exists():
-        print(f"[run_pipeline] ERROR: raw dataset not found at: {raw_path}")
+    if raw_path is None:
+        print("[run_pipeline] ERROR: raw dataset not found.")
+        print("[run_pipeline] Expected one of:")
+        print(f"  - {root / 'data' / 'raw_sales_master.csv'}")
+        print(f"  - {root / 'data' / 'raw_sales.csv'}")
         return 2
 
     print("==========================================")

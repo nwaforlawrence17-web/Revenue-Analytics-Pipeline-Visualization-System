@@ -99,7 +99,16 @@ REGION_CANONICAL_MAP = {
 
 
 def canonical_region(raw_region: str | None) -> str:
-    text = (raw_region or "").strip()
+    if raw_region is None:
+        return "Unknown"
+    # Handle NaN-like values from pandas/NumPy without importing either.
+    try:
+        if raw_region != raw_region:  # NaN is never equal to itself
+            return "Unknown"
+    except Exception:  # noqa: BLE001
+        pass
+
+    text = str(raw_region).strip()
     if text == "":
         return "Unknown"
     upper = text.upper()
@@ -206,6 +215,7 @@ class SemanticLayer:
     def __init__(self, db_path: Path, csv_path: Path) -> None:
         self.db_path = db_path
         self.csv_path = csv_path
+        self._sql_order_date_has_time = False
         
         # Verify DB exists
         if not db_path.exists():
@@ -213,8 +223,9 @@ class SemanticLayer:
 
         with self._get_conn() as conn:
             # Metadata for the dashboard
-            self.date_min = _parse_date(conn.execute("SELECT MIN(order_date) FROM orders").fetchone()[0])
-            self.date_max = _parse_date(conn.execute("SELECT MAX(order_date) FROM orders").fetchone()[0])
+            min_max = conn.execute("SELECT MIN(date(order_date)), MAX(date(order_date)) FROM orders").fetchone()
+            self.date_min = _parse_date(min_max[0] if min_max else None)
+            self.date_max = _parse_date(min_max[1] if min_max else None)
             self.regions = sorted([r[0] for r in conn.execute("SELECT DISTINCT region FROM orders WHERE region IS NOT NULL").fetchall()])
             self.region_groups = sorted([r[0] for r in conn.execute("SELECT DISTINCT region_group FROM orders WHERE region_group IS NOT NULL").fetchall()])
             self.order_statuses = sorted([r[0] for r in conn.execute("SELECT DISTINCT order_status FROM orders WHERE order_status IS NOT NULL").fetchall()])
@@ -225,11 +236,22 @@ class SemanticLayer:
                 for r in conn.execute("SELECT DISTINCT customer_id, customer_name FROM orders ORDER BY customer_name").fetchall()
             ]
 
+            sample = conn.execute("SELECT order_date FROM orders WHERE order_date IS NOT NULL LIMIT 1").fetchone()
+            if sample and isinstance(sample[0], str):
+                self._sql_order_date_has_time = (" " in sample[0]) or ("T" in sample[0])
+
         # Load CSV for "Legacy" mode
         print(f"Loading Legacy Data Lake from {csv_path}...")
         self.df_cache = pd.read_csv(csv_path)
-        self.df_cache['order_date'] = pd.to_datetime(self.df_cache['order_date']).dt.date
+        self.df_cache['order_date'] = pd.to_datetime(self.df_cache['order_date'], errors="coerce", format="mixed").dt.date
         self.df_cache = self.df_cache.rename(columns={'customer': 'customer_id', 'amount_usd': 'revenue_usd'})
+
+        # Canonicalize CSV mode to match the SQL warehouse semantics (filters must line up).
+        if 'region' in self.df_cache.columns:
+            self.df_cache['region'] = self.df_cache['region'].apply(canonical_region)
+            self.df_cache['region_group'] = self.df_cache['region'].apply(region_group)
+        if 'order_status' in self.df_cache.columns:
+            self.df_cache['order_status'] = self.df_cache['order_status'].astype("string").str.upper()
 
     def _get_conn(self):
         conn = sqlite3.connect(self.db_path)
@@ -294,55 +316,165 @@ class SemanticLayer:
             d = d[d['order_status'].isin(st)]
         return d
 
+    @staticmethod
+    def _bucket_key(d: dt.date, time_grain: str) -> str:
+        if time_grain == "day":
+            return d.isoformat()
+        if time_grain == "week":
+            return d.strftime("%Y-%W")  # Monday-based week (matches SQL %W usage)
+        if time_grain == "month":
+            return dt.date(d.year, d.month, 1).isoformat()
+        raise ValueError(f"Unsupported time_grain: {time_grain}")
+
+    def _csv_metric_value(self, metric_id: str, df: pd.DataFrame) -> float:
+        if df.empty:
+            return 0.0
+        if metric_id == "profit_margin_pct":
+            rev = float(df["revenue_usd"].sum())
+            if rev == 0:
+                return 0.0
+            return float(df["profit_usd"].sum()) * 100.0 / rev
+        if metric_id.startswith("revenue"):
+            return float(df["revenue_usd"].sum())
+        return float(df["profit_usd"].sum())
+
+    def _csv_series(self, metric_id: str, df: pd.DataFrame, time_grain: str) -> list[dict[str, Any]]:
+        if df.empty:
+            return []
+
+        work = df.copy()
+        work["bucket"] = work["order_date"].apply(lambda x: self._bucket_key(x, time_grain))
+
+        if metric_id == "profit_margin_pct":
+            grouped = work.groupby("bucket", sort=True).agg({"profit_usd": "sum", "revenue_usd": "sum"})
+            out = []
+            for bucket, row in grouped.iterrows():
+                rev = float(row["revenue_usd"])
+                val = (float(row["profit_usd"]) * 100.0 / rev) if rev else None
+                out.append({"period_start": str(bucket), "value": val})
+            return out
+
+        if metric_id == "revenue_growth_pct":
+            grouped = work.groupby("bucket", sort=True)["revenue_usd"].sum()
+            out = []
+            prev_val: float | None = None
+            for bucket, curr in grouped.items():
+                curr_val = float(curr)
+                growth = ((curr_val - prev_val) / prev_val * 100.0) if (prev_val not in (None, 0.0)) else None
+                out.append({"period_start": str(bucket), "value": growth})
+                prev_val = curr_val
+            return out
+
+        col = "revenue_usd" if metric_id.startswith("revenue") else "profit_usd"
+        grouped = work.groupby("bucket", sort=True)[col].sum()
+        return [{"period_start": str(bucket), "value": float(val)} for bucket, val in grouped.items()]
+
+    def _csv_breakdown(self, metric_id: str, df: pd.DataFrame, group_by: str) -> list[dict[str, Any]]:
+        if df.empty:
+            return []
+        if group_by != "region":
+            return []
+
+        if metric_id == "profit_margin_pct":
+            grouped = df.groupby("region", sort=False).agg({"profit_usd": "sum", "revenue_usd": "sum"}).reset_index()
+            out = []
+            for _, r in grouped.iterrows():
+                rev = float(r["revenue_usd"])
+                val = (float(r["profit_usd"]) * 100.0 / rev) if rev else None
+                out.append({"key": r["region"], "value": val})
+            out.sort(key=lambda x: (x["value"] is None, -(x["value"] or 0.0)))
+            return out
+
+        if metric_id == "revenue_growth_pct":
+            # Growth by region: (curr_rev - prev_rev) / prev_rev * 100
+            return []  # handled by _csv_growth_breakdown in query
+
+        col = "revenue_usd" if metric_id.startswith("revenue") else "profit_usd"
+        grouped = df.groupby("region", sort=False)[col].sum().reset_index()
+        out = [{"key": r["region"], "value": float(r[col])} for _, r in grouped.iterrows()]
+        out.sort(key=lambda x: -(x["value"] or 0.0))
+        return out
+
+    def _csv_growth_breakdown(self, df_curr: pd.DataFrame, df_prev: pd.DataFrame, group_by: str) -> list[dict[str, Any]]:
+        if group_by != "region":
+            return []
+        curr = df_curr.groupby("region")["revenue_usd"].sum().to_dict()
+        prev = df_prev.groupby("region")["revenue_usd"].sum().to_dict()
+
+        keys = sorted(set(curr) | set(prev))
+        out = []
+        for k in keys:
+            prev_val = float(prev.get(k, 0.0) or 0.0)
+            curr_val = float(curr.get(k, 0.0) or 0.0)
+            val = ((curr_val - prev_val) / prev_val * 100.0) if prev_val else None
+            out.append({"key": k, "value": val})
+        out.sort(key=lambda x: (x["value"] is None, -(x["value"] or 0.0)))
+        return out
+
     def _query_metric_csv(self, payload: dict[str, Any]) -> dict[str, Any]:
         metric_id = payload["metric_id"]
         filters = payload.get("filters") or {}
-        time_grain = payload.get("time_grain") or "month"
-        
+
         date_start = _parse_date(filters.get("date_range", {}).get("start"))
         date_end = _parse_date(filters.get("date_range", {}).get("end"))
-        
-        # 1. Current value
-        df_curr = self._filter_df(self.df_cache, filters, status_override=["COMPLETED"])
-        if metric_id == "profit_margin_pct":
-            rev = df_curr['revenue_usd'].sum()
-            value = (df_curr['profit_usd'].sum() / rev * 100) if rev else 0
-        else:
-            value = df_curr['revenue_usd'].sum() if metric_id.startswith('revenue') else df_curr['profit_usd'].sum()
+        if not date_start or not date_end:
+            raise ValueError("Start and end dates are required")
 
-        # 2. Previous period
+        time_grain = payload.get("time_grain") or "month"
+        group_by = payload.get("group_by") or "none"
+
+        df_curr = self._filter_df(self.df_cache, filters, status_override=["COMPLETED"])
+
         prev_start, prev_end = self._previous_period(date_start, date_end)
         prev_filters = {**filters, "date_range": {"start": prev_start.isoformat(), "end": prev_end.isoformat()}}
         df_prev = self._filter_df(self.df_cache, prev_filters, status_override=["COMPLETED"])
-        if metric_id == "profit_margin_pct":
-            rev_p = df_prev['revenue_usd'].sum()
-            comparison_value = (df_prev['profit_usd'].sum() / rev_p * 100) if rev_p else 0
-        else:
-            comparison_value = df_prev['revenue_usd'].sum() if metric_id.startswith('revenue') else df_prev['profit_usd'].sum()
 
-        # 3. Series & Breakdown
-        group_by = payload.get("group_by") or "none"
-        breakdown = []
-        series = []
-        
-        if group_by == "region":
-            bg = df_curr.groupby('region')['revenue_usd' if metric_id.startswith('revenue') else 'profit_usd'].sum().reset_index()
-            breakdown = [{"key": r['region'], "value": r[1]} for _, r in bg.iterrows()]
-        
-        # Simplified series for CSV mode
-        series = [{"period_start": date_start.isoformat(), "value": value}]
+        series = self._csv_series(metric_id, df_curr, time_grain)
 
+        if metric_id == "revenue_growth_pct":
+            curr_rev = self._csv_metric_value("revenue_total_usd", df_curr)
+            prev_rev = self._csv_metric_value("revenue_total_usd", df_prev)
+            value = ((curr_rev - prev_rev) / prev_rev * 100.0) if prev_rev else None
+            result: dict[str, Any] = {
+                "metric_id": metric_id,
+                "value": value,
+                "comparison_value": None,
+                "delta": value,
+                "delta_unit": self.METRICS[metric_id]["unit"],
+                "delta_pct": None,
+                "series": series,
+                "comparison_period": {"start": prev_start.isoformat(), "end": prev_end.isoformat()},
+            }
+            if group_by and group_by not in ["none", "order_date"]:
+                result["breakdown"] = self._csv_growth_breakdown(df_curr, df_prev, group_by)
+            return result
+
+        value = self._csv_metric_value(metric_id, df_curr)
+        comparison_value = self._csv_metric_value(metric_id, df_prev)
         delta = value - comparison_value
-        return {
+        delta_pct = None
+        if metric_id != "profit_margin_pct" and comparison_value:
+            delta_pct = (delta / comparison_value) * 100.0
+
+        result = {
             "metric_id": metric_id,
-            "value": float(value),
-            "comparison_value": float(comparison_value),
-            "delta": float(delta),
+            "value": value,
+            "comparison_value": comparison_value,
+            "delta": delta,
             "delta_unit": "pp" if metric_id == "profit_margin_pct" else self.METRICS[metric_id]["unit"],
+            "delta_pct": delta_pct,
             "series": series,
-            "breakdown": breakdown,
-            "comparison_period": {"start": prev_start.isoformat(), "end": prev_end.isoformat()}
+            "comparison_period": {"start": prev_start.isoformat(), "end": prev_end.isoformat()},
         }
+
+        if metric_id == "profit_margin_pct":
+            series_values = [s["value"] for s in series if s.get("value") is not None]
+            result["distribution"] = _quantile_box(series_values)
+
+        if group_by and group_by not in ["none", "order_date"]:
+            result["breakdown"] = self._csv_breakdown(metric_id, df_curr, group_by)
+
+        return result
 
     def _build_where_clause(self, filters: dict[str, Any], status_override: Optional[list[str]] = None) -> tuple[str, list[Any]]:
         conditions = []
@@ -351,10 +483,16 @@ class SemanticLayer:
         date_range = filters.get("date_range") or {}
         if date_range.get("start"):
             conditions.append("order_date >= ?")
-            params.append(date_range["start"])
+            start = date_range["start"]
+            if self._sql_order_date_has_time and isinstance(start, str) and len(start) == 10:
+                start = start + " 00:00:00"
+            params.append(start)
         if date_range.get("end"):
             conditions.append("order_date <= ?")
-            params.append(date_range["end"])
+            end = date_range["end"]
+            if self._sql_order_date_has_time and isinstance(end, str) and len(end) == 10:
+                end = end + " 23:59:59"
+            params.append(end)
 
         if filters.get("region"):
             placeholders = ",".join(["?"] * len(filters["region"]))
@@ -391,14 +529,38 @@ class SemanticLayer:
             raise ValueError("Start and end dates are required")
 
         time_grain = payload.get("time_grain") or "month"
-        comparison = payload.get("comparison")
+
+        prev_start, prev_end = self._previous_period(date_start, date_end)
+        prev_filters = {**filters, "date_range": {"start": prev_start.isoformat(), "end": prev_end.isoformat()}}
+
+        # Growth KPI is computed as period-over-period revenue growth (%), not revenue dollars.
+        if metric_id == "revenue_growth_pct":
+            curr_rev = self._get_sql_metric("revenue_total_usd", filters)
+            prev_rev = self._get_sql_metric("revenue_total_usd", prev_filters)
+            value = ((curr_rev - prev_rev) / prev_rev * 100.0) if prev_rev else None
+
+            series = self._get_sql_series(metric_id, filters, time_grain)
+            result: dict[str, Any] = {
+                "metric_id": metric_id,
+                "value": value,
+                "comparison_value": None,
+                "delta": value,
+                "delta_unit": self.METRICS[metric_id]["unit"],
+                "delta_pct": None,
+                "series": series,
+                "comparison_period": {"start": prev_start.isoformat(), "end": prev_end.isoformat()},
+            }
+
+            group_by = payload.get("group_by")
+            if group_by and group_by not in ["none", "order_date"]:
+                result["breakdown"] = self._get_sql_growth_breakdown(filters, prev_filters, group_by)
+
+            return result
 
         # 1. Current value
         value = self._get_sql_metric(metric_id, filters)
-        
+
         # 2. Previous period value (for Delta)
-        prev_start, prev_end = self._previous_period(date_start, date_end)
-        prev_filters = {**filters, "date_range": {"start": prev_start.isoformat(), "end": prev_end.isoformat()}}
         comparison_value = self._get_sql_metric(metric_id, prev_filters)
 
         # 3. Time series
@@ -407,9 +569,9 @@ class SemanticLayer:
         delta = (value - comparison_value) if (value is not None and comparison_value is not None) else None
         delta_pct = None
         if metric_id != "profit_margin_pct" and comparison_value:
-            delta_pct = (delta / comparison_value) * 100
+            delta_pct = (delta / comparison_value) * 100.0
 
-        result = {
+        result: dict[str, Any] = {
             "metric_id": metric_id,
             "value": value,
             "comparison_value": comparison_value,
@@ -417,7 +579,7 @@ class SemanticLayer:
             "delta_unit": "pp" if metric_id == "profit_margin_pct" else self.METRICS[metric_id]["unit"],
             "delta_pct": delta_pct,
             "series": series,
-            "comparison_period": {"start": prev_start.isoformat(), "end": prev_end.isoformat()}
+            "comparison_period": {"start": prev_start.isoformat(), "end": prev_end.isoformat()},
         }
 
         if metric_id == "profit_margin_pct":
@@ -437,7 +599,7 @@ class SemanticLayer:
         sql_map = {
             "revenue_total_usd": "SELECT SUM(revenue_usd) FROM orders WHERE ",
             "profit_total_usd":  "SELECT SUM(profit_usd) FROM orders WHERE ",
-            "profit_margin_pct": "SELECT (SUM(profit_usd) / SUM(revenue_usd)) * 100 FROM orders WHERE ",
+            "profit_margin_pct": "SELECT (SUM(profit_usd) * 100.0 / NULLIF(SUM(revenue_usd), 0)) FROM orders WHERE ",
             "revenue_growth_pct": "SELECT SUM(revenue_usd) FROM orders WHERE " # handled differently in growth logic
         }
         
@@ -451,7 +613,7 @@ class SemanticLayer:
         agg_map = {
             "revenue_total_usd": "SUM(revenue_usd)",
             "profit_total_usd":  "SUM(profit_usd)",
-            "profit_margin_pct": "(SUM(profit_usd) / SUM(revenue_usd)) * 100",
+            "profit_margin_pct": "(SUM(profit_usd) * 100.0 / NULLIF(SUM(revenue_usd), 0))",
             "revenue_growth_pct": "SUM(revenue_usd)"
         }
 
@@ -467,6 +629,40 @@ class SemanticLayer:
             rows = conn.execute(sql, params).fetchall()
             return [{"key": r["key"], "value": r["val"]} for r in rows]
 
+    def _get_sql_growth_breakdown(
+        self, filters: dict[str, Any], prev_filters: dict[str, Any], group_by: str
+    ) -> list[dict[str, Any]]:
+        if group_by != "region":
+            return []
+
+        where_curr, params_curr = self._build_where_clause(filters, status_override=["COMPLETED"])
+        where_prev, params_prev = self._build_where_clause(prev_filters, status_override=["COMPLETED"])
+
+        sql = f"""
+            SELECT {group_by} as key, SUM(revenue_usd) as val
+            FROM orders
+            WHERE {{where}}
+            GROUP BY key
+        """
+
+        with self._get_conn() as conn:
+            curr_rows = conn.execute(sql.format(where=where_curr), params_curr).fetchall()
+            prev_rows = conn.execute(sql.format(where=where_prev), params_prev).fetchall()
+
+        curr = {r["key"]: float(r["val"] or 0.0) for r in curr_rows}
+        prev = {r["key"]: float(r["val"] or 0.0) for r in prev_rows}
+
+        keys = sorted(set(curr) | set(prev))
+        out = []
+        for k in keys:
+            prev_val = float(prev.get(k, 0.0) or 0.0)
+            curr_val = float(curr.get(k, 0.0) or 0.0)
+            val = ((curr_val - prev_val) / prev_val * 100.0) if prev_val else None
+            out.append({"key": k, "value": val})
+
+        out.sort(key=lambda x: (x["value"] is None, -(x["value"] or 0.0)))
+        return out
+
     def _get_sql_series(self, metric_id: str, filters: dict[str, Any], time_grain: str) -> list[dict[str, Any]]:
         where, params = self._build_where_clause(filters, status_override=["COMPLETED"])
         
@@ -480,7 +676,7 @@ class SemanticLayer:
         agg_map = {
             "revenue_total_usd": "SUM(revenue_usd)",
             "profit_total_usd":  "SUM(profit_usd)",
-            "profit_margin_pct": "(SUM(profit_usd) / SUM(revenue_usd)) * 100",
+            "profit_margin_pct": "(SUM(profit_usd) * 100.0 / NULLIF(SUM(revenue_usd), 0))",
             "revenue_growth_pct": "SUM(revenue_usd)" # logic applies later
         }
 
@@ -645,4 +841,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
