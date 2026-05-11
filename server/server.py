@@ -19,7 +19,38 @@ from typing import Any, Iterable, Optional
 
 
 def _json_dumps(obj: Any) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    def sanitize(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                return None
+            return value
+        if isinstance(value, dict):
+            return {str(k): sanitize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [sanitize(v) for v in value]
+
+        # numpy scalars / pandas scalars often expose `.item()`.
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                return sanitize(item())
+            except Exception:  # noqa: BLE001
+                pass
+
+        return value
+
+    clean = sanitize(obj)
+    return json.dumps(
+        clean,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def _read_json_body(handler: SimpleHTTPRequestHandler) -> Any:
